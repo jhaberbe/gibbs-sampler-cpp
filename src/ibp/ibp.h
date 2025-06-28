@@ -56,8 +56,8 @@ public:
     void update_latent_membership(size_t index);
     void update_latent_loadings();
 
-    void gibbs_update();
-    void run(size_t n_iterations, bool verbose = true);
+    void gibbs_update(size_t current_iter, size_t remove_every);
+    void run(size_t n_iterations, bool verbose = true, size_t remove_every = 1000);
 
 private:
     CSV csv_;

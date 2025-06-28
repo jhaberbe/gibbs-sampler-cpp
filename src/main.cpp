@@ -18,7 +18,7 @@ int main()
 
         double alpha = 1.0 / std::log(csv.nrows());
         IBP ibp(csv, alpha);
-        ibp.run(1000, true);
+        ibp.run(1000, true, 1000);
 
     } catch (const std::exception& e) {
         std::cerr << "Error during execution: " << e.what() << std::endl;

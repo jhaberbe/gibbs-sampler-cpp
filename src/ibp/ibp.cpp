@@ -13,6 +13,7 @@ IBP::IBP(const CSV csv, double alpha)
 {
     size_t n_rows = csv_.nrows();
     size_t n_cols = csv_.ncols();
+    std::cout << "[IBP] Constructing model with " << n_rows << " rows and " << n_cols << " columns.\n";
 
     log_mean_.resize(n_rows, 0.0);
     log_dispersion_.resize(n_rows, 0.0);
@@ -20,39 +21,44 @@ IBP::IBP(const CSV csv, double alpha)
 
     std::vector<double> row_sums(n_rows, 0.0);
 
-    // Compute row sums
+    std::cout << "[IBP] Computing row sums...\n";
     for (size_t i = 0; i < n_rows; ++i) {
         double sum = 0.0;
+        const auto& row = csv_.get_row(i);  // fetch row once!
         for (size_t j = 0; j < n_cols; ++j)
-            sum += csv_.get_row(i).at(j);
+            sum += row.at(j);
         row_sums[i] = sum;
     }
 
-    // Compute overall mean of row sums
     double mean_row_sum = std::accumulate(row_sums.begin(), row_sums.end(), 0.0) / n_rows;
 
-    // Compute size factors, log means, log dispersions
+    std::cout << "[IBP] Computing size factors, log means, and log dispersions...\n";
     for (size_t i = 0; i < n_rows; ++i) {
-        // --- Size factors ---
         size_factor_[i] = row_sums[i] / mean_row_sum;
-
-        // --- Log mean ---
         double mean_i = row_sums[i] / n_cols;
-        log_mean_[i] = std::log(std::max(mean_i, 1e-8));  // avoid log(0)
+        log_mean_[i] = std::log(std::max(mean_i, 1e-8));
 
-        // --- Variance for MoM dispersion ---
         double var_i = 0.0;
+
+        const auto& row = csv_.get_row(i);  // fetch once!
+
         for (size_t j = 0; j < n_cols; ++j) {
-            double x = csv_.get_row(i).at(j);
+            double x = row.at(j);
             var_i += (x - mean_i) * (x - mean_i);
         }
         var_i /= (n_cols > 1 ? n_cols - 1 : 1);
 
-        // MoM estimate of dispersion: (var - mean) / mean^2
         double disp_i = (var_i > mean_i) ? (var_i - mean_i) / (mean_i * mean_i) : 1e-8;
         log_dispersion_[i] = std::log(std::max(disp_i, 1e-8));
+
+        if (i % std::max(n_rows / 10, size_t(1)) == 0) {
+            std::cout << "[IBP] Processed row " << i << " / " << n_rows << std::endl;
+        }
     }
+
+    std::cout << "[IBP] Initialization complete.\n";
 };
+
 
 void IBP::add_factor() {
     // Collect all occupied keys into a set for fast lookup
@@ -199,15 +205,16 @@ void IBP::update_latent_membership(size_t index) {
     }
 }
 
-// Placeholder update for loadings: implement Polya-Gamma updates here
 void IBP::update_latent_loadings() {
     size_t N = csv_.nrows();
     size_t D = csv_.ncols();
 
+    PolyaGammaSampler pg;  // instantiate once for the entire update
+
     for (auto& kv : factors_) {
         auto& factor = kv.second;
 
-        // Find active rows
+        // Find active rows for this factor
         std::vector<size_t> active_indices;
         for (size_t n = 0; n < N; ++n) {
             if (factor.row_latent(n) > 0.5) active_indices.push_back(n);
@@ -216,7 +223,6 @@ void IBP::update_latent_loadings() {
 
         // Build offset matrix: (N_active x D)
         std::vector<std::vector<double>> offset(active_indices.size(), std::vector<double>(D, 0.0));
-
         for (size_t i = 0; i < active_indices.size(); ++i) {
             size_t n = active_indices[i];
             // Add size factor
@@ -234,7 +240,7 @@ void IBP::update_latent_loadings() {
             }
         }
 
-        // Compute eta = offset + current A
+        // Compute eta = offset + current A_k
         std::vector<std::vector<double>> eta(active_indices.size(), std::vector<double>(D, 0.0));
         for (size_t i = 0; i < active_indices.size(); ++i) {
             for (size_t d = 0; d < D; ++d) {
@@ -242,29 +248,38 @@ void IBP::update_latent_loadings() {
             }
         }
 
-        // Construct Y: (N_active x D)
+        // Construct Y: observed counts (N_active x D)
         std::vector<std::vector<double>> Y(active_indices.size(), std::vector<double>(D, 0.0));
         for (size_t i = 0; i < active_indices.size(); ++i) {
             Y[i] = csv_.get_row(active_indices[i]);
         }
 
         // Sample omega: Polya-Gamma variables (N_active x D)
-        std::vector<std::vector<double>> omega(active_indices.size(), std::vector<double>(D, 1.0)); // Replace with real sampling
-        // Here you would fill omega with your PolyaGamma sampler
-        // omega = polya_gamma_sampler.sample(Y + dispersion, eta);
+        std::vector<std::vector<double>> omega(active_indices.size(), std::vector<double>(D, 1.0));
+        for (size_t i = 0; i < active_indices.size(); ++i) {
+            for (size_t d = 0; d < D; ++d) {
+                double y_nd = Y[i][d];
+                double r = std::exp(log_dispersion_[d]);
+                double b = y_nd + r;
+                double c = eta[i][d];
 
-        // For demonstration, we leave omega=1.0, which reduces to standard IRLS.
+                // optional numerical stability clamp
+                c = std::max(std::min(c, 30.0), -30.0);
+
+                omega[i][d] = pg.sample(b, c, 200);
+            }
+        }
 
         // Posterior update for each dimension d
         for (size_t d = 0; d < D; ++d) {
             double XWX = 0.0, Xy = 0.0;
             for (size_t i = 0; i < active_indices.size(); ++i) {
                 double omega_val = omega[i][d];
-                XWX += omega_val;  // since X=1 per active row
+                XWX += omega_val;  // X=1 per active row
                 Xy += (Y[i][d] - std::exp(log_dispersion_[d])) / 2.0;
             }
 
-            double precision = XWX + 0.01;  // prior precision 0.01 like your Python
+            double precision = XWX + 0.01;  // prior precision
             double posterior_var = 1.0 / precision;
             double posterior_mean = posterior_var * Xy;
 
@@ -276,18 +291,17 @@ void IBP::update_latent_loadings() {
 }
 
 
-// One Gibbs step
-void IBP::gibbs_update() {
+void IBP::gibbs_update(size_t current_iter, size_t remove_every) {
+    std::cout << "[IBP] Starting Gibbs update step (iteration " << current_iter << ")...\n";
 
-    // Iterations with for loops.
     size_t total = csv_.nrows();
     for (size_t n = 0; n < total; ++n) {
         update_latent_membership(n);
         sample_new_factors(n);
-        update_latent_loadings();
+        if (n % 100 == 1){update_latent_loadings();}
 
-        // Progress bar update every 1% or last iteration
-        if (n % (std::max(total / 100, size_t(1))) == 0 || n + 1 == total) {
+        // More frequent progress bar: update every ~0.1% or at end
+        if (n % (std::max(total / 1000, size_t(1))) == 0 || n + 1 == total) {
             double progress = static_cast<double>(n + 1) / total;
             int barWidth = 50;
             std::cout << "\r[";
@@ -297,30 +311,42 @@ void IBP::gibbs_update() {
                 else if (i == pos) std::cout << ">";
                 else std::cout << " ";
             }
-            std::cout << "] " << int(progress * 100.0) << " %" << std::flush;
+            std::cout << "] " << int(progress * 100.0) << " %"
+                      << " | Factors: " << factors_.size() << std::flush;
         }
     }
-    std::cout << std::endl;  // ensure the next output starts on a new line
+    std::cout << "\n[IBP] Finished Gibbs update.\n";
 
-
-    // Remove empty factors
-    std::vector<int> to_remove;
-    for (const auto& kv : factors_) {
-        const auto& factor = kv.second;
-        size_t active = factor.member_count();
-        if (active <= 1) to_remove.push_back(kv.first);
+    // Remove empty factors every remove_every iterations
+    if (remove_every > 0 && (current_iter + 1) % remove_every == 0) {
+        std::cout << "[IBP] Removing empty factors at iteration " << current_iter + 1 << "...\n";
+        std::vector<int> to_remove;
+        for (const auto& kv : factors_) {
+            const auto& factor = kv.second;
+            size_t active = factor.member_count();
+            if (active <= 1) to_remove.push_back(kv.first);
+        }
+        for (int k : to_remove) {
+            std::cout << "[IBP] Removing empty factor " << k << "\n";
+            remove_factor(k);
+        }
     }
-    for (int k : to_remove) remove_factor(k);
 }
 
-// Run Gibbs sampler for n_iterations
-void IBP::run(size_t n_iterations, bool verbose) {
+
+void IBP::run(size_t n_iterations, bool verbose, size_t remove_every) {
+    std::cout << "[IBP] Starting Gibbs sampling for " << n_iterations << " iterations.\n";
     for (size_t iter = 0; iter < n_iterations; ++iter) {
-        gibbs_update();
+        std::cout << "[IBP] ---------------------------\n";
+        std::cout << "[IBP] Iteration " << iter << "\n";
+
+        gibbs_update(iter, remove_every);
+
         if (verbose) {
-            std::cout << "Iteration " << iter
-                      << ", Factors: " << factors_.size()
-                      << ", Log-likelihood: " << log_likelihood() << std::endl;
+            std::cout << "[IBP] Iteration " << iter
+                      << " complete: Factors=" << factors_.size()
+                      << ", Log-likelihood=" << log_likelihood() << "\n";
         }
     }
+    std::cout << "[IBP] Gibbs sampling complete.\n";
 }
